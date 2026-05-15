@@ -1,21 +1,25 @@
 """
 pipeline.py
-End-to-end ZeroDayShield pipeline orchestrator (Classification Stage).
+End-to-end ZeroDayShield pipeline orchestrator.
 
 Stages:
-  0. setup_db   — initialise the vulnerable target database
-  1. app server — start Flask target in background
-  2. sentinel   — start sentinel monitor in background
-  3. attack     — fire SQLi payloads
-  4. forensic   — classify all raised alerts
-  5. summary    — print final report table
+  0. setup_db      — initialise the vulnerable target database
+  1. app server    — start Flask target in background
+  2. sentinel      — start sentinel monitor in background
+  3. attack        — fire SQLi payloads
+  4. forensic      — classify all raised alerts
+  5. patch         — generate + human-review + apply patches
+  6. summary       — print final report table
 
 Usage:
-    python pipeline.py                     # full run
-    python pipeline.py --skip-db           # skip DB init (already done)
-    python pipeline.py --skip-attack       # skip attack (use existing log)
-    python pipeline.py --no-server         # don't start Flask (already running)
-    python pipeline.py --forensic-only     # only run forensic on existing alerts
+    python pipeline.py                       # full interactive run
+    python pipeline.py --skip-db
+    python pipeline.py --skip-attack
+    python pipeline.py --no-server
+    python pipeline.py --forensic-only
+    python pipeline.py --patch-auto-approve  # skip human review in patch stage
+    python pipeline.py --skip-patch          # forensic only, no patching
+    python pipeline.py --dry-run-patch       # show patches but don't write files
 """
 
 from __future__ import annotations
@@ -127,9 +131,22 @@ def stage_forensic() -> list[dict]:
     return reports
 
 
+def stage_patch(
+    auto_approve: bool = False,
+    dry_run: bool = False,
+) -> None:
+    _step(5, "Patch Agent — generate, review & apply fixes")
+    from patch_agent import run_patch_agent
+    run_patch_agent(
+        report_path  = None,
+        auto_approve = auto_approve,
+        dry_run      = dry_run,
+    )
+
+
 def stage_summary(reports: list[dict]):
-    _step(5, "Summary")
-    _banner("ZeroDayShield — Classification Stage Complete")
+    _step(6, "Summary")
+    _banner("ZeroDayShield — Pipeline Complete")
 
     if not reports:
         print("  No reports generated.")
@@ -160,18 +177,25 @@ def stage_summary(reports: list[dict]):
     for sev, cnt in sorted(sev_counts.items(), key=lambda x: -{"Critical":4,"High":3,"Medium":2,"Low":1}.get(x[0],0)):
         print(f"    {SEV_ICONS.get(sev,'⚪')} {sev}: {cnt}")
 
-    print(f"\n  Reports saved to: reports/")
-    print(f"  Next step: run patch_agent.py on the target codebase")
+    print(f"\n  Reports saved to : reports/")
+    print(f"  Patched files    : reports/patched/  (if patch stage ran)")
+    print(f"  Backups          : reports/backups/")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="ZeroDayShield end-to-end pipeline")
-    parser.add_argument("--skip-db",       action="store_true")
-    parser.add_argument("--no-server",     action="store_true")
-    parser.add_argument("--skip-attack",   action="store_true")
-    parser.add_argument("--forensic-only", action="store_true")
+    parser.add_argument("--skip-db",          action="store_true")
+    parser.add_argument("--no-server",        action="store_true")
+    parser.add_argument("--skip-attack",      action="store_true")
+    parser.add_argument("--forensic-only",    action="store_true")
+    parser.add_argument("--skip-patch",       action="store_true",
+                        help="Skip patch agent stage (forensic + summary only)")
+    parser.add_argument("--patch-auto-approve", action="store_true",
+                        help="Auto-approve all patches without human review")
+    parser.add_argument("--dry-run-patch",    action="store_true",
+                        help="Show patches but do not write patched files")
     args = parser.parse_args()
 
     _banner(f"ZeroDayShield — Classification Pipeline  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]")
@@ -182,6 +206,11 @@ def main():
     try:
         if args.forensic_only:
             reports = stage_forensic()
+            if not args.skip_patch:
+                stage_patch(
+                    auto_approve = args.patch_auto_approve,
+                    dry_run      = args.dry_run_patch,
+                )
             stage_summary(reports)
             return
 
@@ -212,6 +241,13 @@ def main():
                 pass
 
         reports = stage_forensic()
+
+        if not args.skip_patch:
+            stage_patch(
+                auto_approve = args.patch_auto_approve,
+                dry_run      = args.dry_run_patch,
+            )
+
         stage_summary(reports)
 
     finally:
