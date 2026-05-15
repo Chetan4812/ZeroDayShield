@@ -1,0 +1,15 @@
+{
+  "vocab_size": 512,
+  "embed_dim": 64,
+  "hidden_dim": 128,
+  "max_len": 64,
+  "num_labels": 2,
+  "id2label": {
+    "0": "safe",
+    "1": "sql_injection"
+  },
+  "label2id": {
+    "safe": 0,
+    "sql_injection": 1
+  }
+}

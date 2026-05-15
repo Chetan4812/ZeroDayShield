@@ -12,11 +12,16 @@ Outputs:
 import json
 import os
 import re
+import sys
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import classification_report, f1_score
+
+# Force UTF-8 output on Windows consoles
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -161,7 +166,7 @@ def train():
             logits = model(batch["input_ids"])
             all_preds.extend(torch.argmax(logits, dim=-1).tolist())
             all_labels.extend(batch["label"].tolist())
-    print("\n── Evaluation report ──")
+    print("\n-- Evaluation report --")
     print(classification_report(all_labels, all_preds,
                                  target_names=list(LABEL2ID.keys())))
 

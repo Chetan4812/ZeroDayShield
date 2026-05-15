@@ -1,0 +1,52 @@
+{"text": "cursor.execute(\"SELECT * FROM logs WHERE user = '%s'\" % username)", "label": 1}
+{"text": "db.execute(\"SELECT * FROM users WHERE token = '\" + token + \"'\")", "label": 1}
+{"text": "db.execute(\"SELECT name FROM categories WHERE id = ?\", [cat_id])", "label": 0}
+{"text": "cursor.execute(\"SELECT * FROM sessions WHERE user_id = ? AND active = 1\", (uid,))", "label": 0}
+{"text": "db.execute(\"SELECT * FROM users WHERE role = '{}'\".format(role))", "label": 1}
+{"text": "db.execute(f\"INSERT INTO logs (event) VALUES ('{event}')\")", "label": 1}
+{"text": "cursor.execute(\"SELECT * FROM payments WHERE txn_id = ?\", (txn,))", "label": 0}
+{"text": "cursor.execute(f\"SELECT * FROM sessions WHERE session_id = '{sid}'\")", "label": 1}
+{"text": "cursor.execute('SELECT ' + col + ' FROM users WHERE id = ' + uid)", "label": 1}
+{"text": "db.execute(\"SELECT * FROM reviews WHERE product_id = ?\", (pid,))", "label": 0}
+{"text": "cursor.execute(\"SELECT * FROM comments WHERE post_id = ?\", (post_id,))", "label": 0}
+{"text": "cursor.execute(\"SELECT * FROM tokens WHERE value = ? AND expired = 0\", (tok,))", "label": 0}
+{"text": "db.execute(f\"UPDATE accounts SET balance = {amount} WHERE id = {acct_id}\")", "label": 1}
+{"text": "cursor.execute(f\"SELECT * FROM products WHERE id = {product_id}\")", "label": 1}
+{"text": "cursor.execute(\"SELECT * FROM messages WHERE recipient = ?\", (user_id,))", "label": 0}
+{"text": "cursor.execute(\"SELECT * FROM cache WHERE key = ?\", (cache_key,))", "label": 0}
+{"text": "sql = 'UPDATE users SET password = \\'' + new_pass + '\\' WHERE id = ' + str(uid)", "label": 1}
+{"text": "cursor.execute(\"SELECT * FROM users WHERE id = %s\" % user_id)", "label": 1}
+{"text": "query = \"SELECT * FROM users WHERE username = '\" + username + \"'\"", "label": 1}
+{"text": "db.execute(\"SELECT * FROM products WHERE category_id = ?\", (category,))", "label": 0}
+{"text": "db.execute(\"SELECT * FROM users WHERE id = \" + user_id)", "label": 1}
+{"text": "cursor.execute(\"SELECT role FROM users WHERE token = ?\", (session_token,))", "label": 0}
+{"text": "cursor.execute(\"SELECT hash FROM api_keys WHERE key = ?\", (api_key,))", "label": 0}
+{"text": "cursor.execute(f\"SELECT * FROM reviews WHERE product = {pid} AND rating > {min_rating}\")", "label": 1}
+{"text": "cursor.execute(\"SELECT * FROM events WHERE type = '{}'\".format(event_type))", "label": 1}
+{"text": "db.execute(\"INSERT INTO messages (body) VALUES ('\" + msg_body + \"')\")", "label": 1}
+{"text": "query = \"UPDATE users SET role = '\" + role + \"' WHERE id = \" + uid", "label": 1}
+{"text": "db.execute(\"INSERT INTO audit (user_id, action) VALUES (?, ?)\", (uid, action))", "label": 0}
+{"text": "cursor.execute(\"SELECT * FROM api_keys WHERE value = '\" + api_key + \"'\")", "label": 1}
+{"text": "cursor.execute(\"DELETE FROM sessions WHERE token = ?\", (token,))", "label": 0}
+{"text": "cursor.execute(\"SELECT * FROM roles WHERE name = '%s'\" % role)", "label": 1}
+{"text": "db.execute(\"SELECT id FROM roles WHERE name = ?\", (role_name,))", "label": 0}
+{"text": "query = 'SELECT * FROM users WHERE email = \\'' + email + '\\''; db.execute(query)", "label": 1}
+{"text": "cursor.execute(\"INSERT INTO users (name, email) VALUES (?, ?)\", (name, email))", "label": 0}
+{"text": "cursor.execute(\"SELECT * FROM users WHERE id = ?\", (user_id,))", "label": 0}
+{"text": "db.execute(\"SELECT * FROM audit WHERE user = '%s'\" % username)", "label": 1}
+{"text": "db.execute(\"UPDATE profiles SET avatar = ? WHERE id = ?\", (avatar_url, uid))", "label": 0}
+{"text": "query = \"SELECT * FROM products WHERE sku = '%s'\" % sku; db.execute(query)", "label": 1}
+{"text": "db.execute(\"SELECT * FROM notifications WHERE user_id = ?\", (user_id,))", "label": 0}
+{"text": "db.execute('SELECT * FROM ' + table_name + ' WHERE id = ' + record_id)", "label": 1}
+{"text": "db.execute(\"SELECT * FROM events WHERE date = ?\", (event_date,))", "label": 0}
+{"text": "db.execute(f\"SELECT * FROM users WHERE name = '{username}'\")", "label": 1}
+{"text": "db.execute(\"DELETE FROM items WHERE name = '{}'\".format(item_name))", "label": 1}
+{"text": "cursor.execute(f\"DELETE FROM sessions WHERE user = '{username}'\")", "label": 1}
+{"text": "cursor.execute(\"DELETE FROM logs WHERE id = \" + record_id)", "label": 1}
+{"text": "db.execute(\"SELECT * FROM cache WHERE key = '{}'\".format(cache_key))", "label": 1}
+{"text": "cursor.execute(\"SELECT * FROM files WHERE owner_id = ?\", (current_user,))", "label": 0}
+{"text": "db.execute('SELECT * FROM files WHERE name = \\'' + filename + '\\'')", "label": 1}
+{"text": "cursor.execute(\"SELECT * FROM users WHERE username = ?\", (username,))", "label": 0}
+{"text": "db.execute(\"INSERT INTO logs (msg) VALUES (?)\", (message,))", "label": 0}
+{"text": "cursor.execute(\"DELETE FROM tokens WHERE user_id = ? AND expired = 1\", (uid,))", "label": 0}
+{"text": "db.execute(f\"SELECT * FROM orders WHERE user_id = {uid} AND status = '{status}'\")", "label": 1}
