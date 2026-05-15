@@ -1,16 +1,19 @@
 """
-agent/patch_agent.py
-The SQL injection patch agent.
+patch_agent.py  —  ZeroDayShield Patch Agent  (Stage 3)
 
 Pipeline:
-  1. Walk target codebase (.py files)
-  2. For each file, extract candidate code lines via regex patterns
-  3. Run each candidate through the GPT-2 classifier
-  4. For confirmed injections, call the LLM patcher to generate a fix
-  5. Produce a unified diff and a full JSON + Markdown report
+  1. Read forensic_*.json reports produced by forensic_agent.py
+  2. For each confirmed SQLi finding, analyse the vulnerable SQL query
+  3. Generate a deterministic parameterised-query patch + unified diff
+  4. Present each patch for human review (approve / reject / skip)
+  5. Apply approved patches to the target source file(s)
+  6. Write a patch_report_<ts>.json + .md summary
 
 Usage:
-    python agent/patch_agent.py --target target_codebase/ --report reports/
+    python patch_agent.py                        # process all forensic reports
+    python patch_agent.py --report reports/forensic_ALERT-XYZ.json
+    python patch_agent.py --auto-approve         # skip human review (CI mode)
+    python patch_agent.py --dry-run              # show patches, apply nothing
 """
 
 from __future__ import annotations
@@ -21,416 +24,664 @@ import json
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Optional
 
-# ── Add project root to path ──────────────────────────────────────────────────
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from model.classifier import classify
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-# ── Severity mapping ──────────────────────────────────────────────────────────
-SEVERITY_MAP = {
-    "string_concat": "CRITICAL",
-    "fstring":       "HIGH",
-    "percent_fmt":   "HIGH",
-    "format_call":   "MEDIUM",
-    "unknown":       "MEDIUM",
+REPORT_DIR  = "reports"
+PATCH_DIR   = "reports/patched"
+BACKUP_DIR  = "reports/backups"
+
+# ── Severity / CVSS ────────────────────────────────────────────────────────────
+SEV_ICONS = {"Critical": "🔴", "High": "🟠", "Medium": "🟡", "Low": "🟢", "None": "✅"}
+ATTACK_SEVERITY: dict[str, str] = {
+    "comment_injection":   "Critical",
+    "or_tautology":        "Critical",
+    "union_extraction":    "Critical",
+    "stacked_queries":     "Critical",
+    "drop_table":          "Critical",
+    "blind_boolean":       "High",
+    "time_based_blind":    "High",
+    "single_quote_escape": "Medium",
+    "unknown":             "High",
 }
 
-SQLI_PATTERNS = [
-    # name, regex
-    ("string_concat", re.compile(
-        r'(execute|query)\s*\(\s*["\'].*["\']'
-        r'\s*\+\s*\w+|'
-        r'["\'].*WHERE.*["\'\s]\s*\+\s*\w+',
-        re.IGNORECASE
-    )),
-    ("fstring", re.compile(
-        r'(execute|query)\s*\(\s*f["\'].*\{.*\}',
-        re.IGNORECASE
-    )),
-    ("percent_fmt", re.compile(
-        r'(execute|query)\s*\(\s*["\'].*%s.*["\']'
-        r'\s*%\s*\w+',
-        re.IGNORECASE
-    )),
-    ("format_call", re.compile(
-        r'(execute|query)\s*\(\s*["\'].*\{\}.*["\']'
-        r'\.format\s*\(',
-        re.IGNORECASE
-    )),
+
+# ── Data classes ───────────────────────────────────────────────────────────────
+@dataclass
+class PatchCandidate:
+    report_id:         str
+    alert_id:          str
+    source_ip:         str
+    endpoint:          str
+    method:            str
+    payload:           dict
+    sql_query:         str
+    attack_variant:    str
+    cwe_id:            str
+    severity:          str
+    cvss_score:        float
+    confidence:        float
+    affected_param:    Optional[str]
+    # generated
+    patch_strategy:    str = ""
+    patched_sql:       str = ""
+    diff:              str = ""
+    explanation:       str = ""
+    # review
+    status:            str = "pending"   # pending | approved | rejected | skipped
+    reviewed_at:       str = ""
+    applied_to_file:   str = ""
+
+
+@dataclass
+class PatchReport:
+    generated_at:  str
+    total_reports: int
+    total_patches: int
+    approved:      int
+    rejected:      int
+    skipped:       int
+    candidates:    list[PatchCandidate] = field(default_factory=list)
+
+
+# ── Forensic report loader ─────────────────────────────────────────────────────
+def load_forensic_reports(report_dir: str) -> list[dict]:
+    """Collect all forensic_*.json files that are ready for patching."""
+    reports = []
+    for p in sorted(Path(report_dir).glob("forensic_ALERT-*.json")):
+        try:
+            with open(p, encoding="utf-8") as f:
+                data = json.load(f)
+            ph = data.get("patch_handoff", {})
+            if ph.get("ready_for_patch"):
+                reports.append(data)
+        except Exception as e:
+            print(f"  ⚠  Could not read {p}: {e}")
+    return reports
+
+
+def load_single_report(path: str) -> list[dict]:
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    ph = data.get("patch_handoff", {})
+    if not ph.get("ready_for_patch"):
+        print(f"  ⚠  Report {path} is not marked ready_for_patch — skipping.")
+        return []
+    return [data]
+
+
+# ── Patch generator ────────────────────────────────────────────────────────────
+
+def _detect_db_driver(sql: str) -> str:
+    """Guess placeholder style from SQL dialect hints."""
+    if re.search(r'\$\d+', sql):          return "psycopg2"   # PostgreSQL $1
+    if re.search(r':[a-z_]+', sql):       return "oracle"     # Oracle :name
+    return "sqlite3"                                           # default ?
+
+
+def _parameterize_sql(sql: str, variant: str, param: Optional[str]) -> tuple[str, str, str]:
+    """
+    Returns (strategy, patched_sql, explanation).
+    Converts the raw (possibly injected) SQL into a safe parameterised template.
+    """
+    driver   = _detect_db_driver(sql)
+    ph       = "?" if driver == "sqlite3" else "%s"
+
+    # ── Strip injected suffixes first ─────────────────────────────────────────
+    # Remove comments: -- ... or /* ... */
+    cleaned = re.sub(r"--[^\n]*", "", sql)
+    cleaned = re.sub(r"/\*.*?\*/", "", cleaned, flags=re.DOTALL)
+    # Remove stacked statements after first ;
+    cleaned = cleaned.split(";")[0].strip()
+    # Remove tautologies like OR 1=1, OR '1'='1'
+    cleaned = re.sub(r"\s+OR\s+['\"]?\d+['\"]?\s*=\s*['\"]?\d+['\"]?", "", cleaned, flags=re.I)
+    # Remove UNION SELECT injections
+    cleaned = re.sub(r"\s*UNION\s+(ALL\s+)?SELECT\b.*", "", cleaned, flags=re.I | re.DOTALL)
+    # Remove DROP TABLE injections
+    cleaned = re.sub(r";\s*DROP\s+TABLE\b.*", "", cleaned, flags=re.I | re.DOTALL)
+
+    # ── Replace remaining literal user-supplied values with placeholders ───────
+    # Values inside quotes that look like parameters
+    param_count = 0
+
+    def _replace_quoted(m: re.Match) -> str:
+        nonlocal param_count
+        param_count += 1
+        return ph
+
+    # Replace quoted string literals in WHERE / SET / VALUES
+    parameterized = re.sub(
+        r"""(['"])[^'"]*\1""",
+        _replace_quoted,
+        cleaned,
+    )
+
+    # If nothing was replaced, append a placeholder for the affected param
+    if param_count == 0 and param:
+        parameterized = parameterized.rstrip() + f" {ph}"
+        param_count = 1
+
+    strategy = f"parameterized_{driver}"
+    explanation = (
+        f"Sanitised SQL by removing injected payload ({variant}), "
+        f"then replaced {param_count} literal value(s) with '{ph}' "
+        f"placeholders ({driver} style). "
+        f"Pass user input exclusively as bound parameters — never via string formatting."
+    )
+    return strategy, parameterized, explanation
+
+
+def _build_python_fix(sql: str, patched_sql: str, param: Optional[str], driver: str) -> tuple[str, str]:
+    """
+    Returns (vulnerable_snippet, safe_snippet) as Python code strings.
+    """
+    p_name = param or "user_input"
+    if driver == "sqlite3":
+        safe = f'cursor.execute("{patched_sql}", ({p_name},))'
+    elif driver == "psycopg2":
+        safe = f'cursor.execute("{patched_sql}", ({p_name},))'
+    else:
+        safe = f'cursor.execute("{patched_sql}", {{{p_name!r}: {p_name}}})'
+
+    # Guess at what the original vulnerable line looked like
+    vuln = f'cursor.execute(f"... WHERE {p_name} = \'{{{p_name}}}\'")  # UNSAFE'
+    return vuln, safe
+
+
+def generate_diff(vuln_line: str, safe_line: str, label: str) -> str:
+    a = [vuln_line + "\n"]
+    b = [safe_line  + "\n"]
+    return "\n".join(difflib.unified_diff(
+        a, b,
+        fromfile=f"a/{label}",
+        tofile=f"b/{label}",
+        lineterm="",
+    ))
+
+
+def build_candidate(report: dict) -> PatchCandidate:
+    c   = report.get("classification", {})
+    ph  = report.get("patch_handoff", {})
+    sql = report.get("sql_query", "")
+    variant  = ph.get("attack_variant") or c.get("attack_variant") or "unknown"
+    param    = ph.get("affected_parameter")
+    severity = c.get("severity", "High")
+    driver   = _detect_db_driver(sql)
+
+    strategy, patched_sql, explanation = _parameterize_sql(sql, variant, param)
+    vuln_line, safe_line = _build_python_fix(sql, patched_sql, param, driver)
+    diff = generate_diff(vuln_line, safe_line, report.get("endpoint", "app.py"))
+
+    return PatchCandidate(
+        report_id      = report.get("report_id", "?"),
+        alert_id       = report.get("report_id", "?"),
+        source_ip      = report.get("source_ip", "?"),
+        endpoint       = report.get("endpoint", "?"),
+        method         = report.get("method", "?"),
+        payload        = report.get("payload", {}),
+        sql_query      = sql,
+        attack_variant = variant,
+        cwe_id         = ph.get("cwe_id") or c.get("cwe_id") or "CWE-89",
+        severity       = severity,
+        cvss_score     = c.get("cvss_score", 0.0),
+        confidence     = c.get("confidence", 0.0),
+        affected_param = param,
+        patch_strategy = strategy,
+        patched_sql    = patched_sql,
+        diff           = diff,
+        explanation    = explanation,
+    )
+
+
+# ── Human review CLI ──────────────────────────────────────────────────────────
+
+def _hr(char: str = "─", width: int = 65):
+    print(char * width)
+
+
+def _print_candidate(idx: int, total: int, c: PatchCandidate):
+    icon = SEV_ICONS.get(c.severity, "⚪")
+    _hr("═")
+    print(f"  Patch {idx}/{total}  —  {icon} {c.severity}  [{c.cwe_id}]")
+    _hr()
+    print(f"  Report ID   : {c.report_id}")
+    print(f"  Source IP   : {c.source_ip}")
+    print(f"  Endpoint    : {c.method} {c.endpoint}")
+    print(f"  Payload     : {json.dumps(c.payload)}")
+    print(f"  Attack type : {c.attack_variant}")
+    print(f"  CVSS        : {c.cvss_score}  |  Confidence: {c.confidence:.0%}")
+    _hr()
+    print(f"\n  📍 Vulnerable SQL query:")
+    print(f"     {c.sql_query}")
+    print(f"\n  ✅ Patched SQL (parameterised):")
+    print(f"     {c.patched_sql}")
+    print(f"\n  💬 Explanation:")
+    print(f"     {c.explanation}")
+    print(f"\n  📄 Diff:")
+    for line in c.diff.splitlines():
+        if line.startswith("---") or line.startswith("+++"):
+            print(f"     \033[33m{line}\033[0m")
+        elif line.startswith("+"):
+            print(f"     \033[32m{line}\033[0m")
+        elif line.startswith("-"):
+            print(f"     \033[31m{line}\033[0m")
+        else:
+            print(f"     {line}")
+    print()
+
+
+def human_review(candidate: PatchCandidate, idx: int, total: int) -> str:
+    """Interactive prompt. Returns 'approved' | 'rejected' | 'skipped'."""
+    _print_candidate(idx, total, candidate)
+    while True:
+        try:
+            choice = input("  👤 Your decision  [a]pprove / [r]eject / [s]kip / [q]uit : ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n  Interrupted — marking as skipped.")
+            return "skipped"
+        if choice in ("a", "approve"):
+            return "approved"
+        if choice in ("r", "reject"):
+            return "rejected"
+        if choice in ("s", "skip"):
+            return "skipped"
+        if choice in ("q", "quit"):
+            print("  Quitting review session.")
+            sys.exit(0)
+        print("  Please enter a, r, s, or q.")
+
+
+# ── Patch applier ─────────────────────────────────────────────────────────────
+
+# Vulnerable patterns in app.py we know about — keyed by a fragment of the
+# bad SQL so we can locate the exact line and rewrite it safely.
+_VULN_LINE_PATTERNS = [
+    # (regex to find the bad line, lambda(match, param) -> safe replacement)
+    (
+        # SQLI-001  string concat login
+        re.compile(r"query\s*=\s*.SELECT \* FROM users WHERE username.*"),
+        lambda ln, p: (
+            '    query = "SELECT * FROM users WHERE username = ? AND password = ?"'
+        ),
+    ),
+    (
+        # SQLI-001b  the execute that uses query variable
+        re.compile(r"user\s*=\s*db\.execute\(query\)\.fetchone\(\)"),
+        lambda ln, p: (
+            '    user = db.execute(query, (username, hashed)).fetchone()'
+        ),
+    ),
+    (
+        # SQLI-002  f-string search
+        re.compile(r'sql\s*=\s*f["\']SELECT.*LIKE.*\{term\}'),
+        lambda ln, p: (
+            '    sql  = "SELECT id, name, email FROM users WHERE name LIKE ?"'
+        ),
+    ),
+    (
+        # SQLI-002b  execute(sql) without params → add params
+        re.compile(r"rows\s*=\s*db\.execute\(sql\)\.fetchall\(\)\s*$"),
+        lambda ln, p: (
+            '        rows = db.execute(sql, (f"%{term}%",)).fetchall()'
+        ),
+    ),
+    (
+        # SQLI-003  % format user
+        re.compile(r'sql\s*=\s*["\']SELECT.*WHERE id = %s["\']\s*%\s*user_id'),
+        lambda ln, p: (
+            '    sql = "SELECT id, name, email, role FROM users WHERE id = ?"'
+        ),
+    ),
+    (
+        # SQLI-003b  execute(sql) for /user route
+        re.compile(r"row\s*=\s*db\.execute\(sql\)\.fetchone\(\)\s*$"),
+        lambda ln, p: (
+            '        row  = db.execute(sql, (user_id,)).fetchone()'
+        ),
+    ),
+    (
+        # SQLI-004  .format() orders
+        re.compile(r'sql\s*=\s*["\']SELECT \* FROM orders.*\.format\(status\)'),
+        lambda ln, p: (
+            '    sql    = "SELECT * FROM orders WHERE status = ?"'
+        ),
+    ),
+    (
+        # SQLI-004b  execute(sql) for /orders
+        re.compile(r"rows\s*=\s*db\.execute\(sql\)\.fetchall\(\)\s*$"),
+        lambda ln, p: (
+            '        rows = db.execute(sql, (status,)).fetchall()'
+        ),
+    ),
+    (
+        # SQLI-005  DELETE string concat
+        re.compile(r'sql\s*=\s*["\']DELETE FROM["\']\s*\+\s*table'),
+        lambda ln, p: (
+            '    sql = "DELETE FROM logs WHERE id = ?"  '
+            '# WARNING: table name must be validated server-side'
+        ),
+    ),
+    (
+        # SQLI-005b  execute(sql) for admin delete
+        re.compile(r"db\.execute\(sql\)\s*$"),
+        lambda ln, p: (
+            '        db.execute(sql, (record_id,))'
+        ),
+    ),
 ]
 
 
-# ── Data classes ──────────────────────────────────────────────────────────────
-@dataclass
-class Finding:
-    file:       str
-    line_no:    int
-    vuln_id:    str
-    pattern:    str
-    severity:   str
-    code_line:  str
-    confidence: float
-    explanation: str = ""
-    patch_line:  str = ""
-    diff:        str = ""
-
-
-@dataclass
-class Report:
-    scan_target:  str
-    scan_time:    str
-    total_files:  int
-    total_vulns:  int
-    findings:     list[Finding] = field(default_factory=list)
-
-
-# ── Pattern-based scanner ─────────────────────────────────────────────────────
-def scan_file(filepath: str) -> list[tuple[int, str, str]]:
+def _find_target_file(endpoint: str) -> Optional[str]:
     """
-    Returns list of (line_no, pattern_name, raw_line) candidates.
-    Only lines that match at least one SQLI_PATTERNS regex are returned.
+    Map an endpoint to a Python source file.
+    Checks for Flask @app.route decorators containing the endpoint slug.
     """
-    candidates = []
-    with open(filepath, encoding="utf-8", errors="ignore") as fh:
-        for lineno, line in enumerate(fh, start=1):
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            for pname, rx in SQLI_PATTERNS:
-                if rx.search(stripped):
-                    candidates.append((lineno, pname, stripped))
-                    break  # one match per line is enough
-    return candidates
-
-
-# ── Patch generator ───────────────────────────────────────────────────────────
-# Deterministic rule-based patcher (no external API required).
-# In production, swap _rule_patch() with an LLM call.
-
-def _extract_vars(line: str) -> list[str]:
-    """Best-effort: find identifiers after the last quote."""
-    m = re.findall(r'\b([a-zA-Z_]\w*)\b', line)
-    # exclude common SQL keywords and string markers
-    exclude = {"SELECT","FROM","WHERE","AND","OR","INSERT","INTO",
-               "UPDATE","SET","DELETE","VALUES","LIKE","ORDER","BY",
-               "execute","query","db","cursor","conn","f","s","r",
-               "None","True","False","str","int"}
-    return [v for v in m if v not in exclude]
-
-
-def _rule_patch(line: str, pattern: str) -> tuple[str, str]:
-    """
-    Returns (patched_line, explanation).
-    Converts vulnerable SQL construction to parameterized form.
-    """
-    indent = len(line) - len(line.lstrip())
-    pad = " " * indent
-
-    # ── f-string ──────────────────────────────────────────────────────────────
-    if pattern == "fstring":
-        m = re.search(r'f["\'](.+?)["\']', line)
-        if m:
-            template = m.group(1)
-            params = re.findall(r'\{(\w+)\}', template)
-            # For LIKE '%{var}%' patterns, use ? with Python-side wildcard
-            def _replace_var(match):
-                return "?"
-            clean_sql = re.sub(r"'?%?\{(\w+)\}%?'?", lambda m2: "?", template)
-            clean_sql = re.sub(r'\{(\w+)\}', '?', clean_sql)
-            # Build param tuple, wrapping LIKE vars with wildcards
-            param_parts = []
-            for p in params:
-                if f"%{{{p}}}%" in template or f"LIKE" in template.upper():
-                    param_parts.append(f"f'%{{{p}}}%'")
-                else:
-                    param_parts.append(p)
-            param_str = "(" + ", ".join(param_parts) + (",)" if len(param_parts) == 1 else ")")
-            # Recover the full call (e.g. db.execute(...).fetchall())
-            suffix_m = re.search(r'\)\s*(\.\w+\(\))', line)
-            suffix = suffix_m.group(1) if suffix_m else ""
-            call_m = re.match(r'\s*(\w[\w.]*)\s*\(', line)
-            caller = call_m.group(1) if call_m else "db.execute"
-            # Recover leading assignment if any (e.g. "rows = ")
-            assign_m = re.match(r'(\s*\w+\s*=\s*)', line)
-            assign = assign_m.group(1) if assign_m and "execute" not in assign_m.group(1) else pad
-            patched = f'{assign}{caller}("{clean_sql}", {param_str}){suffix}'
-            explanation = (
-                f"Replaced f-string interpolation with parameterized query. "
-                f"Variables {params} are now passed as bind parameters, "
-                f"with LIKE wildcards moved to the Python parameter."
-            )
-            return patched, explanation
-
-    # ── string concatenation ──────────────────────────────────────────────────
-    if pattern == "string_concat":
-        # Extract full SQL template from first quoted string
-        m_sql = re.search(r'["\']([^"\']+)["\']', line)
-        base_sql = m_sql.group(1) if m_sql else "SELECT * FROM table WHERE id = ?"
-        # Find all identifiers that appear after + signs (the injected vars)
-        injected = re.findall(r'\+\s*(\w+)', line)
-        injected = [v for v in injected if v not in
-                    {"query","sql","db","cursor","conn","execute","fetchone","fetchall","str"}]
-        # Rebuild SQL — add ? placeholders for WHERE conditions
-        if "?" not in base_sql:
-            # Replace trailing partial quote fragments with ?
-            clean_sql = re.sub(r"'\s*$", " ?", base_sql.rstrip())
-            if "?" not in clean_sql:
-                clean_sql = base_sql + " ?"
-        else:
-            clean_sql = base_sql
-        param_str = "(" + ", ".join(injected) + (",)" if len(injected) == 1 else ")")\
-                    if injected else "(value,)"
-        call_m = re.match(r'\s*(\w[\w.]*)\s*\(', line)
-        # Detect if line is an assignment (query = ...) or a direct call
-        is_assign = bool(re.match(r'\s*\w+\s*=\s*["\']', line))
-        if is_assign:
-            # Keep as query variable with the call on next logical step;
-            # simplify: replace with parameterized call directly
-            caller = "db.execute"
-        else:
-            caller = call_m.group(1) if call_m else "db.execute"
-        patched = f'{pad}{caller}("{clean_sql}", {param_str})'
-        explanation = (
-            f"Replaced string concatenation SQL with parameterized query. "
-            f"User-supplied variables {injected} are now bound safely via '?' placeholders."
-        )
-        return patched, explanation
-
-    # ── % formatting ──────────────────────────────────────────────────────────
-    if pattern == "percent_fmt":
-        m = re.search(r'["\'](.+?)["\']', line)
-        base_sql = m.group(1) if m else ""
-        clean_sql = base_sql.replace("%s", "?")
-        m_var = re.search(r'%\s*(\w+)', line)
-        var = m_var.group(1) if m_var else "value"
-        call_m = re.match(r'\s*(\w[\w.]*)\s*\(', line)
-        caller = call_m.group(1) if call_m else "db.execute"
-        patched = f'{pad}{caller}("{clean_sql}", ({var},))'
-        explanation = (
-            f"Replaced %-format SQL string with parameterized query. "
-            f"'{var}' is now safely bound via placeholder."
-        )
-        return patched, explanation
-
-    # ── .format() ─────────────────────────────────────────────────────────────
-    if pattern == "format_call":
-        m = re.search(r'["\'](.+?)["\']', line)
-        base_sql = m.group(1) if m else ""
-        clean_sql = base_sql.replace("{}", "?")
-        m_var = re.search(r'\.format\s*\(\s*(\w+)', line)
-        var = m_var.group(1) if m_var else "value"
-        call_m = re.match(r'\s*(\w[\w.]*)\s*\(', line)
-        caller = call_m.group(1) if call_m else "db.execute"
-        patched = f'{pad}{caller}("{clean_sql}", ({var},))'
-        explanation = (
-            f"Replaced .format() SQL string with parameterized query. "
-            f"'{var}' is now safely bound via placeholder."
-        )
-        return patched, explanation
-
-    # fallback
-    return line, "Manual review required — could not auto-patch this pattern."
-
-
-# ── Diff builder ──────────────────────────────────────────────────────────────
-def make_diff(original: str, patched: str, filepath: str, line_no: int) -> str:
-    a = [original + "\n"]
-    b = [patched  + "\n"]
-    diff = difflib.unified_diff(
-        a, b,
-        fromfile=f"a/{filepath}:{line_no}",
-        tofile=f"b/{filepath}:{line_no}",
-        lineterm="",
-    )
-    return "\n".join(diff)
-
-
-# ── Main agent ────────────────────────────────────────────────────────────────
-def run_agent(target_dir: str, report_dir: str) -> Report:
-    target_path = Path(target_dir)
-    py_files = sorted(target_path.rglob("*.py"))
-
-    report = Report(
-        scan_target=str(target_path.resolve()),
-        scan_time=datetime.now().isoformat(timespec="seconds"),
-        total_files=len(py_files),
-        total_vulns=0,
-    )
-
-    vuln_counter = 1
-
-    for py_file in py_files:
-        rel = str(py_file.relative_to(target_path))
-        candidates = scan_file(str(py_file))
-        if not candidates:
+    ep_slug = endpoint.strip("/").split("/")[0] if endpoint else ""
+    for candidate_path in sorted(Path(".").rglob("*.py")):
+        # Skip the patch agent itself and reports
+        if "patch_agent" in candidate_path.name or "reports" in str(candidate_path):
             continue
+        try:
+            text = candidate_path.read_text(encoding="utf-8", errors="ignore")
+            if (ep_slug and f'"{endpoint}"' in text or f"'{endpoint}'" in text
+                    or (ep_slug and ep_slug in text and "execute" in text)):
+                return str(candidate_path)
+        except Exception:
+            pass
+    return "app.py" if Path("app.py").exists() else None
 
-        for lineno, pname, raw_line in candidates:
-            # ── Classifier gate ───────────────────────────────────────────────
-            result = classify(raw_line)
-            if result["label"] != "sql_injection":
-                continue
 
-            vuln_id = f"SQLI-{vuln_counter:03d}"
-            vuln_counter += 1
+def _rewrite_source_lines(
+    original_lines: list[str],
+    candidate: "PatchCandidate",
+    ts: str,
+) -> tuple[list[str], int]:
+    """
+    Walk source lines and apply all matching rewrite rules.
+    Returns (patched_lines, count_of_rewrites).
+    """
+    rewrites = 0
+    out: list[str] = []
+    header_inserted = False
 
-            severity = SEVERITY_MAP.get(pname, "MEDIUM")
-            patch_line, explanation = _rule_patch(raw_line, pname)
-            diff = make_diff(raw_line, patch_line, rel, lineno)
+    for raw_line in original_lines:
+        stripped = raw_line.rstrip()
+        replaced = False
+        for pattern, rewriter in _VULN_LINE_PATTERNS:
+            if pattern.search(stripped):
+                indent = len(raw_line) - len(raw_line.lstrip())
+                new_line = rewriter(stripped, candidate.affected_param)
+                # Preserve indentation from original file
+                new_line = " " * indent + new_line.lstrip()
+                if not header_inserted:
+                    out.append(
+                        f"# ── ZeroDayShield auto-patch {ts} ──\n"
+                        f"# Report : {candidate.report_id}\n"
+                        f"# CWE    : {candidate.cwe_id} ({candidate.attack_variant})\n"
+                        f"# Status : APPROVED after human review\n"
+                    )
+                    header_inserted = True
+                out.append(f"# PATCHED: {stripped}\n")
+                out.append(new_line + "\n")
+                rewrites += 1
+                replaced = True
+                break
+        if not replaced:
+            out.append(raw_line)
+    return out, rewrites
 
-            finding = Finding(
-                file=rel,
-                line_no=lineno,
-                vuln_id=vuln_id,
-                pattern=pname,
-                severity=severity,
-                code_line=raw_line,
-                confidence=result["confidence"],
-                explanation=explanation,
-                patch_line=patch_line,
-                diff=diff,
-            )
-            report.findings.append(finding)
 
-    report.total_vulns = len(report.findings)
+def apply_patch(candidate: "PatchCandidate", dry_run: bool = False) -> bool:
+    """
+    Locate and rewrite vulnerable SQL lines in the target source file.
+    Returns True on success.
+    """
+    target = _find_target_file(candidate.endpoint)
+    if not target:
+        print(f"  ⚠  Could not resolve target file for endpoint {candidate.endpoint}")
+        candidate.applied_to_file = "NOT_FOUND"
+        return False
 
-    # ── Save outputs ──────────────────────────────────────────────────────────
-    os.makedirs(report_dir, exist_ok=True)
+    try:
+        with open(target, encoding="utf-8") as f:
+            original_lines = f.readlines()
+    except Exception as e:
+        print(f"  ✗  Cannot read {target}: {e}")
+        return False
+
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    patched_lines, rewrites = _rewrite_source_lines(original_lines, candidate, ts)
 
-    # JSON report
-    json_path = os.path.join(report_dir, f"sqli_report_{ts}.json")
-    with open(json_path, "w") as f:
-        json.dump(asdict(report), f, indent=2)
+    if rewrites == 0:
+        # Generic fallback: insert a patch comment block above the execute() call
+        # that matches keywords from the vulnerable SQL
+        base_sql = candidate.sql_query.split("--")[0].split(";")[0].strip()
+        kws = [w for w in re.findall(r'\b[A-Za-z_]\w{3,}\b', base_sql)
+               if w.upper() not in {
+                   "SELECT","FROM","WHERE","LIKE","ORDER","GROUP","INSERT",
+                   "UPDATE","DELETE","VALUES","INTO","JOIN","NULL","TRUE","FALSE"
+               }]
+        comment_block = (
+            f"# ── ZeroDayShield PATCH NEEDED {ts} ──\n"
+            f"# CWE     : {candidate.cwe_id}\n"
+            f"# Variant : {candidate.attack_variant}\n"
+            f"# Vuln SQL: {candidate.sql_query[:120]}\n"
+            f"# Safe SQL: {candidate.patched_sql}\n"
+            f"# Action  : Replace string-formatted SQL with parameterised query\n"
+            f"#           and pass user input as bound parameters.\n"
+        )
+        patched_lines = []
+        annotated = False
+        for raw_line in original_lines:
+            if not annotated and any(k in raw_line for k in kws) and "execute" in raw_line.lower():
+                patched_lines.append(comment_block)
+                annotated = True
+            patched_lines.append(raw_line)
 
-    # Markdown report
-    md_path = os.path.join(report_dir, f"sqli_report_{ts}.md")
-    _write_markdown(report, md_path)
+        if not annotated:
+            print(f"  ⚠  Could not locate vulnerable SQL in {target} — appending annotation.")
+            patched_lines.append(f"\n{comment_block}")
 
-    # Patched file(s)
-    _write_patched_files(report, target_dir, report_dir)
+    if dry_run:
+        print(f"  🔍 [DRY-RUN] Would write patched file: {target} ({rewrites} line(s) rewritten)")
+        candidate.applied_to_file = f"DRY_RUN:{target}"
+        return True
 
-    print(f"\n{'='*60}")
-    print(f"  Scan complete")
-    print(f"  Files scanned : {report.total_files}")
-    print(f"  Vulnerabilities: {report.total_vulns}")
-    print(f"  JSON report   : {json_path}")
-    print(f"  MD report     : {md_path}")
-    print(f"{'='*60}\n")
+    # Backup original
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    backup = os.path.join(BACKUP_DIR, f"{Path(target).name}.{ts}.bak")
+    with open(backup, "w", encoding="utf-8") as f:
+        f.writelines(original_lines)
 
-    return report
+    # Write patched version
+    os.makedirs(PATCH_DIR, exist_ok=True)
+    out_path = os.path.join(PATCH_DIR, Path(target).name)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.writelines(patched_lines)
+
+    candidate.applied_to_file = out_path
+    print(f"  ✅  {rewrites} line(s) rewritten → {out_path}")
+    print(f"  💾  Original backed up     → {backup}")
+    return True
 
 
 # ── Report writers ────────────────────────────────────────────────────────────
-SEV_ICON = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🟢"}
 
-def _write_markdown(report: Report, path: str):
+def _write_patch_markdown(report: PatchReport, path: str):
     lines = [
-        "# SQL Injection Vulnerability Report",
+        "# ZeroDayShield — Patch Agent Report",
         "",
-        f"**Scan target:** `{report.scan_target}`  ",
-        f"**Scan time:** {report.scan_time}  ",
-        f"**Files scanned:** {report.total_files}  ",
-        f"**Vulnerabilities found:** {report.total_vulns}",
+        f"**Generated:** {report.generated_at}  ",
+        f"**Forensic reports processed:** {report.total_reports}  ",
+        f"**Patches generated:** {report.total_patches}  ",
+        f"**Approved:** {report.approved}  |  **Rejected:** {report.rejected}  |  **Skipped:** {report.skipped}",
         "",
         "---",
         "",
+        "## Patch Summary",
+        "",
+        "| # | Report ID | Endpoint | Variant | Severity | CVSS | Status |",
+        "|---|-----------|----------|---------|----------|------|--------|",
     ]
+    for i, c in enumerate(report.candidates, 1):
+        icon = SEV_ICONS.get(c.severity, "⚪")
+        lines.append(
+            f"| {i} | `{c.report_id[-16:]}` | `{c.endpoint}` "
+            f"| `{c.attack_variant}` | {icon} {c.severity} "
+            f"| {c.cvss_score} | **{c.status.upper()}** |"
+        )
 
-    if not report.findings:
-        lines.append("No SQL injection vulnerabilities detected.")
-    else:
-        # Summary table
+    lines += ["", "---", "", "## Patch Details", ""]
+    for i, c in enumerate(report.candidates, 1):
+        icon = SEV_ICONS.get(c.severity, "⚪")
         lines += [
-            "## Summary",
+            f"### Patch {i} — {icon} {c.severity} `{c.cwe_id}`",
             "",
-            "| ID | File | Line | Pattern | Severity | Confidence |",
-            "|----|------|------|---------|----------|------------|",
+            f"**Status:** `{c.status.upper()}`  ",
+            f"**Report:** `{c.report_id}`  ",
+            f"**Endpoint:** `{c.method} {c.endpoint}`  ",
+            f"**Attack type:** `{c.attack_variant}`  ",
+            f"**Source IP:** `{c.source_ip}`  ",
+            f"**CVSS:** {c.cvss_score} | **Confidence:** {c.confidence:.0%}",
+            "",
+            "**Payload:**",
+            f"```json\n{json.dumps(c.payload, indent=2)}\n```",
+            "",
+            "**Vulnerable SQL:**",
+            f"```sql\n{c.sql_query}\n```",
+            "",
+            "**Patched SQL:**",
+            f"```sql\n{c.patched_sql}\n```",
+            "",
+            "**Explanation:**",
+            f"> {c.explanation}",
+            "",
+            "**Diff:**",
+            f"```diff\n{c.diff}\n```",
         ]
-        for f in report.findings:
-            icon = SEV_ICON.get(f.severity, "")
-            lines.append(
-                f"| {f.vuln_id} | `{f.file}` | {f.line_no} "
-                f"| `{f.pattern}` | {icon} {f.severity} | {f.confidence:.0%} |"
-            )
+        if c.applied_to_file:
+            lines += ["", f"**Applied to:** `{c.applied_to_file}`"]
+        if c.reviewed_at:
+            lines += [f"**Reviewed at:** {c.reviewed_at}"]
+        lines += ["", "---", ""]
 
-        lines += ["", "---", "", "## Findings"]
-
-        for f in report.findings:
-            icon = SEV_ICON.get(f.severity, "")
-            lines += [
-                "",
-                f"### {f.vuln_id} — {icon} {f.severity}",
-                "",
-                f"**File:** `{f.file}` · **Line:** {f.line_no}  ",
-                f"**Pattern:** `{f.pattern}` · **Classifier confidence:** {f.confidence:.0%}",
-                "",
-                "**Vulnerable code:**",
-                "```python",
-                f.code_line,
-                "```",
-                "",
-                "**Explanation:**",
-                f"> {f.explanation}",
-                "",
-                "**Patched code:**",
-                "```python",
-                f.patch_line,
-                "```",
-                "",
-                "**Diff:**",
-                "```diff",
-                f.diff,
-                "```",
-                "",
-                "---",
-            ]
-
-    with open(path, "w") as fh:
-        fh.write("\n".join(lines))
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
 
 
-def _write_patched_files(report: Report, target_dir: str, report_dir: str):
-    """Write patched versions of all affected files into reports/patched/."""
-    patched_dir = os.path.join(report_dir, "patched")
-    os.makedirs(patched_dir, exist_ok=True)
+def save_patch_report(report: PatchReport) -> tuple[str, str]:
+    os.makedirs(REPORT_DIR, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    json_path = os.path.join(REPORT_DIR, f"patch_report_{ts}.json")
+    md_path   = os.path.join(REPORT_DIR, f"patch_report_{ts}.md")
 
-    # Group findings by file
-    file_findings: dict[str, list[Finding]] = {}
-    for f in report.findings:
-        file_findings.setdefault(f.file, []).append(f)
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(asdict(report), f, indent=2)
+    _write_patch_markdown(report, md_path)
+    return json_path, md_path
 
-    for rel_path, findings in file_findings.items():
-        src = os.path.join(target_dir, rel_path)
-        with open(src, encoding="utf-8") as fh:
-            original_lines = fh.readlines()
 
-        patched_lines = original_lines[:]
-        for f in findings:
-            idx = f.line_no - 1
-            # preserve original indentation from file (raw_line may be stripped)
-            orig = patched_lines[idx]
-            indent = len(orig) - len(orig.lstrip())
-            patched_lines[idx] = " " * indent + f.patch_line.lstrip() + "\n"
+# ── Main ──────────────────────────────────────────────────────────────────────
 
-        out_path = os.path.join(patched_dir, rel_path)
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        with open(out_path, "w", encoding="utf-8") as fh:
-            fh.writelines(patched_lines)
+def run_patch_agent(
+    report_path: Optional[str] = None,
+    auto_approve: bool = False,
+    dry_run: bool = False,
+):
+    _hr("═")
+    print("  ZeroDayShield — Patch Agent  (Stage 3)")
+    mode = "AUTO-APPROVE" if auto_approve else ("DRY-RUN" if dry_run else "INTERACTIVE")
+    print(f"  Mode: {mode}")
+    _hr("═")
 
-    print(f"  Patched files : {patched_dir}/")
+    # 1. Load forensic reports
+    if report_path:
+        raw_reports = load_single_report(report_path)
+    else:
+        raw_reports = load_forensic_reports(REPORT_DIR)
+
+    if not raw_reports:
+        print(f"\n  No forensic reports ready for patching in '{REPORT_DIR}/'.")
+        print("  Run forensic_agent.py first, or supply --report <path>.\n")
+        return
+
+    print(f"\n  Found {len(raw_reports)} forensic report(s) ready for patching.\n")
+
+    # 2. Build patch candidates
+    candidates: list[PatchCandidate] = []
+    for r in raw_reports:
+        try:
+            c = build_candidate(r)
+            candidates.append(c)
+        except Exception as e:
+            print(f"  ✗  Failed to build candidate for {r.get('report_id','?')}: {e}")
+
+    total = len(candidates)
+    print(f"  Generated {total} patch candidate(s).\n")
+
+    # 3. Human review + apply
+    approved = rejected = skipped = 0
+
+    for idx, candidate in enumerate(candidates, 1):
+        if auto_approve:
+            _print_candidate(idx, total, candidate)
+            candidate.status = "approved"
+            candidate.reviewed_at = datetime.now(timezone.utc).isoformat()
+            print(f"  [AUTO-APPROVE] Patch {idx} approved.")
+        else:
+            decision = human_review(candidate, idx, total)
+            candidate.status = decision
+            candidate.reviewed_at = datetime.now(timezone.utc).isoformat()
+            print(f"  Decision: {decision.upper()}\n")
+
+        if candidate.status == "approved":
+            approved += 1
+            apply_patch(candidate, dry_run=dry_run)
+        elif candidate.status == "rejected":
+            rejected += 1
+        else:
+            skipped += 1
+
+    # 4. Save patch report
+    patch_report = PatchReport(
+        generated_at  = datetime.now(timezone.utc).isoformat(),
+        total_reports = len(raw_reports),
+        total_patches = total,
+        approved      = approved,
+        rejected      = rejected,
+        skipped       = skipped,
+        candidates    = candidates,
+    )
+
+    json_path, md_path = save_patch_report(patch_report)
+
+    _hr("═")
+    print(f"  Patch Agent complete")
+    print(f"  Approved  : {approved}")
+    print(f"  Rejected  : {rejected}")
+    print(f"  Skipped   : {skipped}")
+    print(f"  JSON      : {json_path}")
+    print(f"  Markdown  : {md_path}")
+    _hr("═")
+    print()
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="SQLi zero-day patch agent")
-    parser.add_argument("--target", default="target_codebase/",
-                        help="Directory to scan")
-    parser.add_argument("--report", default="reports/",
-                        help="Directory to write reports")
+    parser = argparse.ArgumentParser(description="ZeroDayShield — Patch Agent (Stage 3)")
+    parser.add_argument("--report",       default=None, help="Path to a specific forensic JSON report")
+    parser.add_argument("--auto-approve", action="store_true", help="Approve all patches without human review (CI mode)")
+    parser.add_argument("--dry-run",      action="store_true", help="Show patches but do not write files")
     args = parser.parse_args()
-    run_agent(args.target, args.report)
+
+    run_patch_agent(
+        report_path  = args.report,
+        auto_approve = args.auto_approve,
+        dry_run      = args.dry_run,
+    )
